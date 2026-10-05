@@ -193,6 +193,55 @@ class TempLimits:
 
 
 @dataclass(frozen=True)
+class PrecursorLimits:
+    """前兆判定阈值、防抖轮次与降流观察节拍。
+
+    温升速率与电压变化各设预警、重警两条线：单轴越预警线是弱前兆（可降流观察），
+    双轴同时越线或单轴达重警线是强前兆（直接切簇）。确认与解除轮次提供防抖，
+    观察时长与降流系数决定降流观察档的处置强度。
+    """
+
+    temp_rise_warn_c_per_min: float
+    temp_rise_trip_c_per_min: float
+    voltage_drop_warn_v: float
+    voltage_drop_trip_v: float
+    delta_rise_warn_mv: float
+    delta_rise_trip_mv: float
+    window_s: float
+    confirm_rounds: int
+    clear_rounds: int
+    observe_s: float
+    observe_derate_ratio: float
+    temp_margin_c: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "PrecursorLimits":
+        limits = cls(
+            temp_rise_warn_c_per_min=_number(section, "temp_rise_warn_c_per_min", minimum=0.0),
+            temp_rise_trip_c_per_min=_number(section, "temp_rise_trip_c_per_min", minimum=0.0),
+            voltage_drop_warn_v=_number(section, "voltage_drop_warn_v", minimum=0.0),
+            voltage_drop_trip_v=_number(section, "voltage_drop_trip_v", minimum=0.0),
+            delta_rise_warn_mv=_number(section, "delta_rise_warn_mv", minimum=0.0),
+            delta_rise_trip_mv=_number(section, "delta_rise_trip_mv", minimum=0.0),
+            window_s=_number(section, "window_s", minimum=1.0),
+            confirm_rounds=_integer(section, "confirm_rounds", minimum=1),
+            clear_rounds=_integer(section, "clear_rounds", minimum=1),
+            observe_s=_number(section, "observe_s", minimum=1.0),
+            observe_derate_ratio=_number(section, "observe_derate_ratio", minimum=0.0),
+            temp_margin_c=_number(section, "temp_margin_c", minimum=0.0),
+        )
+        if limits.temp_rise_warn_c_per_min >= limits.temp_rise_trip_c_per_min:
+            raise ConfigError("温升速率预警线必须低于重警线", component="config")
+        if limits.voltage_drop_warn_v >= limits.voltage_drop_trip_v:
+            raise ConfigError("电压跌落预警线必须低于重警线", component="config")
+        if limits.delta_rise_warn_mv >= limits.delta_rise_trip_mv:
+            raise ConfigError("压差劣化预警线必须低于重警线", component="config")
+        if limits.observe_derate_ratio > 1.0:
+            raise ConfigError("降流观察系数不能大于 1", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class FireLimits:
     """消防探测阀值、阀行程与保持时长。"""
 
@@ -350,6 +399,7 @@ class StationConfig:
     soc: SocLimits
     balance: BalanceLimits
     quota: QuotaLimits
+    precursor: PrecursorLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -373,6 +423,7 @@ class StationConfig:
             soc=SocLimits.from_mapping(_section(limits, "soc")),
             balance=BalanceLimits.from_mapping(_section(limits, "balance")),
             quota=QuotaLimits.from_mapping(_section(limits, "quota")),
+            precursor=PrecursorLimits.from_mapping(_section(limits, "precursor")),
         )
 
 
@@ -403,6 +454,7 @@ def default_config() -> StationConfig:
         soc=SocLimits(280.0, 0.98, 7200.0, 3.0, 50.0),
         balance=BalanceLimits(25.0, 4.0, 2.0, 600.0, 2),
         quota=QuotaLimits(24.0, 2000.0, 2000.0, 1.2, 0.4),
+        precursor=PrecursorLimits(1.0, 3.0, 0.05, 0.2, 30.0, 80.0, 60.0, 3, 6, 300.0, 0.5, 5.0),
     )
 
 
@@ -486,6 +538,20 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "discharge_quota_kwh": cfg.quota.discharge_quota_kwh,
                 "tariff_peak": cfg.quota.tariff_peak,
                 "tariff_valley": cfg.quota.tariff_valley,
+            },
+            "precursor": {
+                "temp_rise_warn_c_per_min": cfg.precursor.temp_rise_warn_c_per_min,
+                "temp_rise_trip_c_per_min": cfg.precursor.temp_rise_trip_c_per_min,
+                "voltage_drop_warn_v": cfg.precursor.voltage_drop_warn_v,
+                "voltage_drop_trip_v": cfg.precursor.voltage_drop_trip_v,
+                "delta_rise_warn_mv": cfg.precursor.delta_rise_warn_mv,
+                "delta_rise_trip_mv": cfg.precursor.delta_rise_trip_mv,
+                "window_s": cfg.precursor.window_s,
+                "confirm_rounds": cfg.precursor.confirm_rounds,
+                "clear_rounds": cfg.precursor.clear_rounds,
+                "observe_s": cfg.precursor.observe_s,
+                "observe_derate_ratio": cfg.precursor.observe_derate_ratio,
+                "temp_margin_c": cfg.precursor.temp_margin_c,
             },
         },
     }

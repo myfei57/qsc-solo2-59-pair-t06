@@ -1,9 +1,9 @@
 """平台装配与控制循环。
 
 ``Platform`` 把各组件按真实联控链接起来，并暴露五类动作：并离网切换、充放电、
-均衡、温度采集与消防联动。控制循环每个周期做六件事：采集温度并刷新降额基线、
-核对保护判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块
-动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
+均衡、温度采集与消防联动。控制循环每个周期做七件事：采集温度并刷新降额基线、
+核对保护判据、前兆判定与处置升级、核对各簇就绪、按校准估算 SOC、滚动配额周期、
+把计数落盘。跨模块动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
 """
 
 from __future__ import annotations
@@ -26,9 +26,11 @@ from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ops.charge import charge_rack
 from .ops.discharge import discharge_rack
+from .ops.precursor import dispose_precursor
 from .ops.suppression import suppress
 from .ops.transfer import transfer_to_grid
 from .pcs.pcs import Pcs
+from .precursor.guard import PrecursorGuard
 from .rack.cells import Cell
 from .rack.mapping import RackMapping
 from .rack.pack import Pack
@@ -106,6 +108,8 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.guard = PrecursorGuard(self.config.precursor)
+        self._derate_sources: dict[str, float] = {"temperature": 1.0, "grid": 1.0}
 
         self._cycles = 0
         self._operations = 0
@@ -131,6 +135,7 @@ class Platform:
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
             ("station", "audit", "run-audit"),
+            ("station", "precursor", "precursor-guard"),
         ):
             self.namespaces.register(area, device, kind)
         for rack_id, rack in self.racks.items():
@@ -169,6 +174,11 @@ class Platform:
         if key not in self.racks:
             raise KeyError(f"未知的簇: {key}")
         return self.racks[key]
+
+    def _apply_derate(self) -> dict:
+        """按来源表合成降额并下发；任何来源都不允许把前兆系数冲掉。"""
+
+        return self.pcs.apply_derate(**self._derate_sources).as_dict()
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -416,7 +426,8 @@ class Platform:
                 },
             ]
             ratio = self.temp.charge_limit_ratio()
-            self.pcs.apply_derate(temperature=ratio, grid=1.0)
+            self._derate_sources["temperature"] = ratio
+            self._apply_derate()
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "temperature", report)
             return {**report, **summary, "charge_limit_ratio": round(ratio, 4)}
@@ -519,6 +530,32 @@ class Platform:
             self.bus.publish(Event.of("fire", "fire", "released", station=self.station, severity="notice"))
             return {"fire": released, "pcs": reset}
 
+    def release_precursor(self, rack_id: str | None = None) -> dict:
+        """人工解除某簇的前兆处置：清监视状态、档位与故障闩锁。
+
+        PCS 跳闸复位仍走既有路径；解除后若前兆仍在，下一控制周期会重新升级。
+        """
+
+        with self._lock:
+            rack = self._rack(rack_id)
+            was_active = self.guard.monitor.reset(rack.rack_id)
+            entry = self.guard.ladder.confirm(rack.rack_id, "normal", self.clock.now(), {"reasons": ["manual_release"]})
+            self._derate_sources.pop("precursor", None)
+            self._apply_derate()
+            cleared = self.bms.clear_fault(rack.rack_id)
+            self.bus.publish(
+                Event.of(
+                    "precursor",
+                    "precursor",
+                    "released",
+                    station=self.station,
+                    severity="notice",
+                    rack_id=rack.rack_id,
+                    was_active=was_active,
+                )
+            )
+            return {"rack_id": rack.rack_id, "was_active": was_active, "entry": entry, "fault_cleared": cleared}
+
     def monitor_frequency(self, frequency_hz: float = 50.0) -> dict:
         """记一次并网点频率采样。"""
 
@@ -562,16 +599,48 @@ class Platform:
             temperatures: dict[str, float] = {}
             ratios: dict[str, float] = {}
             trips: list[str] = []
+            precursor: dict[str, dict] = {}
             for rack_id, rack in self.racks.items():
                 applied = self.temp.apply_temperature(rack.temperature_c(), now, rack.rating_v(), rack.rating_epoch)
                 temperatures[rack_id] = applied["temperature_c"]
                 ratios[rack_id] = round(self.temp.charge_limit_ratio(), 4)
-                self.trend.append(f"{rack_id}.temperature", now, rack.temperature_c())
-                self.trend.append(f"{rack_id}.voltage", now, rack.voltage_v())
+                metrics = rack.metrics()
+                self.trend.append(f"{rack_id}.temperature", now, metrics.max_temperature_c)
+                self.trend.append(f"{rack_id}.voltage", now, metrics.voltage_v)
+                self.trend.append(f"{rack_id}.delta_mv", now, metrics.delta_mv)
                 violations = self.bms.protection(rack)
                 if violations:
                     trips.append(f"{rack_id}:{','.join(violations)}")
                     self.pcs.trip(f"protection:{rack_id}")
+                disposal = dispose_precursor(
+                    self.guard,
+                    self.pcs,
+                    self.bms,
+                    rack,
+                    self.trend,
+                    self.config.bms,
+                    derate_sources=self._derate_sources,
+                    protection_violations=violations,
+                    now=now,
+                )
+                precursor[rack_id] = {
+                    "level": disposal["to"],
+                    "verdict": disposal["evaluation"]["verdict"]["level"],
+                    "violations": disposal["violations"],
+                }
+                if disposal["from"] != disposal["to"] or disposal["violations"]:
+                    self.bus.publish(
+                        Event.of(
+                            "precursor",
+                            "precursor",
+                            f"level_{disposal['to']}",
+                            station=self.station,
+                            severity="alarm" if disposal["to"] == "isolated" or disposal["violations"] else "warning",
+                            rack_id=rack_id,
+                            reasons=",".join(disposal["reasons"]),
+                            violations=disposal["violations"],
+                        )
+                    )
                 self.bms.ready(rack)
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
@@ -583,6 +652,7 @@ class Platform:
                 "temperatures": temperatures,
                 "charge_limit_ratio": ratios,
                 "trips": trips,
+                "precursor": precursor,
                 "quota_rolled": rolled["rolled"],
                 "pcs_state": self.pcs.state_machine.state,
             }
@@ -737,6 +807,9 @@ class Platform:
     def quota_snapshot(self) -> dict:
         return self.quota.snapshot(self.clock.now()).as_dict()
 
+    def precursor_snapshot(self) -> dict:
+        return self.guard.snapshot().as_dict()
+
     def audit_snapshot(self) -> dict:
         return self.audit.snapshot().as_dict()
 
@@ -767,6 +840,7 @@ class Platform:
             "grid": self.grid_snapshot(),
             "soc": self.soc_snapshot(),
             "balance": self.balance_snapshot(),
+            "precursor": self.precursor_snapshot(),
         }
 
     def snapshot(self) -> dict:
@@ -804,5 +878,6 @@ def build_platform(
             soc=resolved.soc,
             balance=resolved.balance,
             quota=resolved.quota,
+            precursor=resolved.precursor,
         )
     return Platform(config=resolved, clock=clock, rack_count=rack_count)

@@ -78,6 +78,20 @@
       "discharge_quota_kwh": 2000.0,
       "tariff_peak": 1.2,
       "tariff_valley": 0.4
+    },
+    "precursor": {
+      "temp_rise_warn_c_per_min": 1.0,
+      "temp_rise_trip_c_per_min": 3.0,
+      "voltage_drop_warn_v": 0.05,
+      "voltage_drop_trip_v": 0.2,
+      "delta_rise_warn_mv": 30.0,
+      "delta_rise_trip_mv": 80.0,
+      "window_s": 60.0,
+      "confirm_rounds": 3,
+      "clear_rounds": 6,
+      "observe_s": 300.0,
+      "observe_derate_ratio": 0.5,
+      "temp_margin_c": 5.0
     }
   }
 }
