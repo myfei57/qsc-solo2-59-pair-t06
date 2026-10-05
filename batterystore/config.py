@@ -193,6 +193,50 @@ class TempLimits:
 
 
 @dataclass(frozen=True)
+class PrecursorLimits:
+    """前兆判据、观察窗口与升级阶梯约束。"""
+
+    rate_warn_c_per_min: float
+    rate_trip_c_per_min: float
+    volt_drop_mv: float
+    volt_collapse_mv: float
+    window_s: float
+    min_samples: int
+    confirm_rounds: int
+    observe_s: float
+    settle_margin_s: float
+    derate_ratio: float
+    recover_hold_s: float
+    action_retries: int
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "PrecursorLimits":
+        limits = cls(
+            rate_warn_c_per_min=_number(section, "rate_warn_c_per_min", minimum=0.0),
+            rate_trip_c_per_min=_number(section, "rate_trip_c_per_min", minimum=0.0),
+            volt_drop_mv=_number(section, "volt_drop_mv", minimum=0.0),
+            volt_collapse_mv=_number(section, "volt_collapse_mv", minimum=0.0),
+            window_s=_number(section, "window_s", minimum=1.0),
+            min_samples=_integer(section, "min_samples", minimum=2),
+            confirm_rounds=_integer(section, "confirm_rounds", minimum=1),
+            observe_s=_number(section, "observe_s", minimum=1.0),
+            settle_margin_s=_number(section, "settle_margin_s", minimum=0.0),
+            derate_ratio=_number(section, "derate_ratio", minimum=0.0),
+            recover_hold_s=_number(section, "recover_hold_s", minimum=0.0),
+            action_retries=_integer(section, "action_retries", minimum=1),
+        )
+        if limits.rate_warn_c_per_min >= limits.rate_trip_c_per_min:
+            raise ConfigError("温升速率告警线必须低于直切线", component="config")
+        if limits.volt_drop_mv >= limits.volt_collapse_mv:
+            raise ConfigError("电压跌落告警线必须低于崩塌线", component="config")
+        if limits.derate_ratio > 1.0:
+            raise ConfigError("观察期降流系数不能大于 1", component="config")
+        if limits.recover_hold_s >= limits.observe_s:
+            raise ConfigError("恢复确认时长必须小于观察期，否则干净簇也会被超时升级", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class FireLimits:
     """消防探测阀值、阀行程与保持时长。"""
 
@@ -345,6 +389,7 @@ class StationConfig:
     bms: BmsLimits
     pcs: PcsLimits
     temp: TempLimits
+    precursor: PrecursorLimits
     fire: FireLimits
     grid: GridLimits
     soc: SocLimits
@@ -368,6 +413,7 @@ class StationConfig:
             bms=BmsLimits.from_mapping(_section(limits, "bms")),
             pcs=PcsLimits.from_mapping(_section(limits, "pcs")),
             temp=TempLimits.from_mapping(_section(limits, "temp")),
+            precursor=PrecursorLimits.from_mapping(_section(limits, "precursor")),
             fire=FireLimits.from_mapping(_section(limits, "fire")),
             grid=GridLimits.from_mapping(_section(limits, "grid")),
             soc=SocLimits.from_mapping(_section(limits, "soc")),
@@ -398,6 +444,7 @@ def default_config() -> StationConfig:
         bms=BmsLimits(60.0, 35.0, 15.0, 92.0, 120.0, 2, 55.0, 120.0),
         pcs=PcsLimits(500.0, 5.0, 25.0, 2.0, 0.97, 40.0, 4.0, 200.0, 240.0),
         temp=TempLimits(40.0, 55.0, 0.25, 1800.0, 0.05, 45.0),
+        precursor=PrecursorLimits(0.5, 2.0, 25.0, 120.0, 60.0, 4, 2, 600.0, 120.0, 0.3, 300.0, 2),
         fire=FireLimits(1200.0, 58.0, 30.0, 4.0, 60.0, 4),
         grid=GridLimits(400.0, 450.0, 50.0, 0.2, 10.0),
         soc=SocLimits(280.0, 0.98, 7200.0, 3.0, 50.0),
@@ -450,6 +497,20 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "baseline_ttl_s": cfg.temp.baseline_ttl_s,
                 "cool_rate_c_per_s": cfg.temp.cool_rate_c_per_s,
                 "warn_c": cfg.temp.warn_c,
+            },
+            "precursor": {
+                "rate_warn_c_per_min": cfg.precursor.rate_warn_c_per_min,
+                "rate_trip_c_per_min": cfg.precursor.rate_trip_c_per_min,
+                "volt_drop_mv": cfg.precursor.volt_drop_mv,
+                "volt_collapse_mv": cfg.precursor.volt_collapse_mv,
+                "window_s": cfg.precursor.window_s,
+                "min_samples": cfg.precursor.min_samples,
+                "confirm_rounds": cfg.precursor.confirm_rounds,
+                "observe_s": cfg.precursor.observe_s,
+                "settle_margin_s": cfg.precursor.settle_margin_s,
+                "derate_ratio": cfg.precursor.derate_ratio,
+                "recover_hold_s": cfg.precursor.recover_hold_s,
+                "action_retries": cfg.precursor.action_retries,
             },
             "fire": {
                 "smoke_ppm": cfg.fire.smoke_ppm,

@@ -62,6 +62,12 @@ class Pcs:
     def protection(self) -> PcsProtection:
         return self._protection
 
+    @property
+    def derate(self) -> DerateFactor:
+        """返回当前生效的降额合成结果，供回读核对。"""
+
+        return self._derate
+
     def is_tied(self) -> bool:
         """是否处于并网态。"""
 

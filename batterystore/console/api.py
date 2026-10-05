@@ -62,6 +62,7 @@ class Api:
         add("GET", "/api/bms", lambda params, body: self._platform.bms_snapshot())
         add("GET", "/api/pcs", lambda params, body: self._platform.pcs_snapshot())
         add("GET", "/api/temp", lambda params, body: self._platform.temp_snapshot())
+        add("GET", "/api/precursor", lambda params, body: self._platform.precursor_snapshot())
         add("GET", "/api/fire", lambda params, body: self._platform.fire_snapshot())
         add("GET", "/api/grid", lambda params, body: self._platform.grid_snapshot())
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
@@ -95,6 +96,8 @@ class Api:
         add("POST", "/api/fault/clear", self._fault_clear)
         add("POST", "/api/fire/drill", self._drill)
         add("POST", "/api/fire/release", lambda params, body: self._platform.release_fire())
+        add("POST", "/api/precursor/scan", self._precursor_scan)
+        add("POST", "/api/precursor/reset", self._precursor_reset)
         add("POST", "/api/frequency", self._frequency)
         add("POST", "/api/soc", self._soc)
         add("POST", "/api/disturb", self._disturb)
@@ -242,6 +245,12 @@ class Api:
             temperature_c=_as_float(body, "temperature_c", 30.0),
             confirm_dt=_as_float(body, "confirm_dt", 5.0),
         )
+
+    def _precursor_scan(self, params: dict, body: dict) -> dict:
+        return self._platform.precursor_scan(rack_id=body.get("rack_id"))
+
+    def _precursor_reset(self, params: dict, body: dict) -> dict:
+        return self._platform.precursor_reset(rack_id=body.get("rack_id"))
 
     def _frequency(self, params: dict, body: dict) -> dict:
         return self._platform.monitor_frequency(frequency_hz=_as_float(body, "frequency_hz", 50.0))

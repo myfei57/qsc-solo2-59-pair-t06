@@ -43,6 +43,20 @@
       "cool_rate_c_per_s": 0.05,
       "warn_c": 45.0
     },
+    "precursor": {
+      "rate_warn_c_per_min": 0.5,
+      "rate_trip_c_per_min": 2.0,
+      "volt_drop_mv": 25.0,
+      "volt_collapse_mv": 120.0,
+      "window_s": 60.0,
+      "min_samples": 4,
+      "confirm_rounds": 2,
+      "observe_s": 600.0,
+      "settle_margin_s": 120.0,
+      "derate_ratio": 0.3,
+      "recover_hold_s": 300.0,
+      "action_retries": 2
+    },
     "fire": {
       "smoke_ppm": 1200.0,
       "temp_trip_c": 58.0,

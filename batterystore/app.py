@@ -1,9 +1,10 @@
 """平台装配与控制循环。
 
 ``Platform`` 把各组件按真实联控链接起来，并暴露五类动作：并离网切换、充放电、
-均衡、温度采集与消防联动。控制循环每个周期做六件事：采集温度并刷新降额基线、
-核对保护判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块
-动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
+均衡、温度采集与消防联动。控制循环每个周期做七件事：采集温度并刷新降额基线、
+核对保护判据、保护未动作时做前兆评估（温升速率与电压变化的配合关系）、核对
+各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块动作都由
+:mod:`batterystore.ops` 的编排一次性走完并写审计。
 """
 
 from __future__ import annotations
@@ -26,9 +27,11 @@ from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ops.charge import charge_rack
 from .ops.discharge import discharge_rack
+from .ops.precursor import evaluate_rack
 from .ops.suppression import suppress
 from .ops.transfer import transfer_to_grid
 from .pcs.pcs import Pcs
+from .precursor.control import PrecursorControl
 from .rack.cells import Cell
 from .rack.mapping import RackMapping
 from .rack.pack import Pack
@@ -101,6 +104,7 @@ class Platform:
         self.bms = Bms(self.config.bms, self.clock, self.config.rack, self.config.soc.calibrate_ttl_s)
         self.pcs = Pcs(self.config.pcs)
         self.temp = TempControl(self.config.temp)
+        self.precursor = PrecursorControl(self.config.precursor, self.trend)
         self.fire = FireLinkage(self.config.fire, [f"Z{i + 1}" for i in range(self.config.fire.zone_count)])
         self.grid = GridTie(self.config.grid)
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
@@ -483,6 +487,36 @@ class Platform:
             self.bus.publish(Event.of("bms", "bms", "fault_clear", station=self.station, severity="notice", rack_id=key))
             return {"rack_id": key, "cleared": cleared}
 
+    def precursor_scan(self, rack_id: str | None = None) -> dict:
+        """手动对一簇做一次前兆评估，与周期评估走同一条链。"""
+
+        with self._lock:
+            rack = self._rack(rack_id)
+            if self.pcs.cut.is_tripped():
+                return {"rack_id": rack.rack_id, "skipped": "pcs_tripped", "level": self.precursor.ladder(rack.rack_id).level}
+            report = evaluate_rack(
+                self.precursor,
+                self.pcs,
+                self.bms,
+                self.temp,
+                rack,
+                protection_temp_c=self.config.bms.protection_temp_c,
+                now=self.clock.now(),
+            )
+            self._note_precursor(rack.rack_id, report, {})
+            return report
+
+    def precursor_reset(self, rack_id: str | None = None) -> dict:
+        """人工复位一簇的处置阶梯：闩锁档的唯一出口。"""
+
+        with self._lock:
+            rack = self._rack(rack_id)
+            entry = self.precursor.ladder(rack.rack_id).reset(self.clock.now())
+            self.bus.publish(
+                Event.of("precursor", "precursor", "reset", station=self.station, severity="notice", rack_id=rack.rack_id, **entry)
+            )
+            return {"rack_id": rack.rack_id, "reset": entry}
+
     def fire_drill(
         self,
         zone: str = DEFAULT_ZONE,
@@ -508,6 +542,9 @@ class Platform:
             if report["ok"]:
                 self._drills += 1
                 self._persist()
+                stamped = self.clock.now()
+                for member in self.mapping.racks_of_zone(zone):
+                    self.precursor.ladder(member).note_suppression(stamped)
             return {**report, **summary}
 
     def release_fire(self) -> dict:
@@ -553,6 +590,35 @@ class Platform:
                 "delta_mv": round(metrics.delta_mv, 2),
             }
 
+    def _note_precursor(self, rack_id: str, report: dict, collector: dict) -> None:
+        """把一次前兆评估的换档、回退与异常保持写成事件，并汇总进周期报告。"""
+
+        transition = report.get("transition")
+        if transition:
+            if transition["ok"]:
+                action = "escalate" if transition["to"] != "normal" else "recover"
+                severity = {"watch": "warning", "isolate": "alarm"}.get(transition["to"], "notice")
+            else:
+                action = "rollback"
+                severity = "alarm"
+            detail = {key: value for key, value in transition.items() if key != "ok"}
+            self.bus.publish(
+                Event.of("precursor", "precursor", action, station=self.station, severity=severity, rack_id=rack_id, **detail)
+            )
+        for step in report.get("steps", []):
+            if step["action"] == "isolate_broken":
+                self.bus.publish(
+                    Event.of("precursor", "precursor", "isolate_broken", station=self.station, severity="alarm", rack_id=rack_id)
+                )
+        assessment = report["assessment"]
+        if report["level"] != "normal" or assessment["level"] != "none" or transition:
+            collector[rack_id] = {
+                "level": report["level"],
+                "assessment": assessment["level"],
+                "window_s": assessment["window_s"],
+                "reasons": assessment["reasons"],
+            }
+
     def cycle(self, dt: float = 5.0) -> dict:
         """推进一个控制周期。"""
 
@@ -562,6 +628,7 @@ class Platform:
             temperatures: dict[str, float] = {}
             ratios: dict[str, float] = {}
             trips: list[str] = []
+            precursor: dict[str, dict] = {}
             for rack_id, rack in self.racks.items():
                 applied = self.temp.apply_temperature(rack.temperature_c(), now, rack.rating_v(), rack.rating_epoch)
                 temperatures[rack_id] = applied["temperature_c"]
@@ -572,6 +639,18 @@ class Platform:
                 if violations:
                     trips.append(f"{rack_id}:{','.join(violations)}")
                     self.pcs.trip(f"protection:{rack_id}")
+                elif not self.pcs.cut.is_tripped():
+                    # 现有保护优先；保护未动作时前兆判定才补更早期的一档。
+                    report = evaluate_rack(
+                        self.precursor,
+                        self.pcs,
+                        self.bms,
+                        self.temp,
+                        rack,
+                        protection_temp_c=self.config.bms.protection_temp_c,
+                        now=now,
+                    )
+                    self._note_precursor(rack_id, report, precursor)
                 self.bms.ready(rack)
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
@@ -583,6 +662,7 @@ class Platform:
                 "temperatures": temperatures,
                 "charge_limit_ratio": ratios,
                 "trips": trips,
+                "precursor": precursor,
                 "quota_rolled": rolled["rolled"],
                 "pcs_state": self.pcs.state_machine.state,
             }
@@ -722,6 +802,9 @@ class Platform:
         rack = self._rack(DEFAULT_RACK)
         return self.temp.snapshot(self.clock.now(), rack.rating_epoch).as_dict()
 
+    def precursor_snapshot(self) -> dict:
+        return self.precursor.snapshot()
+
     def fire_snapshot(self) -> dict:
         return self.fire.snapshot().as_dict()
 
@@ -763,6 +846,7 @@ class Platform:
             "bms": self.bms_snapshot(),
             "pcs": self.pcs_snapshot(),
             "temp": self.temp_snapshot(),
+            "precursor": self.precursor_snapshot(),
             "fire": self.fire_snapshot(),
             "grid": self.grid_snapshot(),
             "soc": self.soc_snapshot(),
@@ -799,6 +883,7 @@ def build_platform(
             bms=resolved.bms,
             pcs=resolved.pcs,
             temp=resolved.temp,
+            precursor=resolved.precursor,
             fire=resolved.fire,
             grid=resolved.grid,
             soc=resolved.soc,
